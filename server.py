@@ -1,78 +1,105 @@
-#!/usr/bin/env python3
-"""TCP job submission server with a thread-safe in-memory FIFO queue."""
-from __future__ import annotations
-
-import argparse
-import json
-import queue
-import socketserver
+import socket
 import threading
+import queue
 import uuid
-from datetime import datetime, timezone
-from typing import Any
+
+from common import send_message, receive_message
+from scheduler import scheduler_loop
+
+HOST = "0.0.0.0"
+PORT = 5000
+
+job_queue = queue.Queue()
+workers = {}
+busy_workers = set()
+lock = threading.Lock()
 
 
-class JobQueue:
-    def __init__(self) -> None:
-        self.items: queue.Queue[dict[str, Any]] = queue.Queue()
-        self._counter = 0
-        self._lock = threading.Lock()
+def handle_connection(conn, address):
+    worker_id = None
 
-    def submit(self, payload: Any, client: str) -> dict[str, Any]:
-        with self._lock:
-            self._counter += 1
-            job_id = f"job-{self._counter:06d}"
-            job = {
-                "job_id": job_id,
-                "payload": payload,
-                "client": client,
-                "submitted_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self.items.put(job)
-            return job
+    try:
+        data = receive_message(conn)
 
-
-JOBS = JobQueue()
-
-
-class JobRequestHandler(socketserver.StreamRequestHandler):
-    def handle(self) -> None:
-        # One newline-delimited JSON request per TCP connection.
-        raw = self.rfile.readline(1_000_001)
-        if not raw:
+        if data is None:
             return
-        try:
-            request = json.loads(raw.decode("utf-8"))
-            if not isinstance(request, dict) or request.get("type") != "submit":
-                raise ValueError("request must be an object with type 'submit'")
-            if "payload" not in request:
-                raise ValueError("request is missing 'payload'")
-            job = JOBS.submit(request["payload"], self.client_address[0])
-            response = {"type": "ack", "status": "queued", **job}
-            print(f"QUEUED {job['job_id']} from {self.client_address[0]}", flush=True)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            response = {"type": "error", "status": "rejected", "message": str(exc)}
-        self.wfile.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
+
+        if data.get("type") == "register":
+            worker_id = data.get("worker_id")
+
+            with lock:
+                workers[worker_id] = conn
+
+            print(f"[SERVER] Worker registered: {worker_id}")
+
+            while True:
+                message = receive_message(conn)
+
+                if message is None:
+                    break
+
+                if message.get("type") == "result":
+                    print(
+                        f"[SERVER] Worker {worker_id} "
+                        f"completed job {message.get('job_id')}"
+                    )
+
+                    with lock:
+                        busy_workers.discard(worker_id)
+
+        elif data.get("type") == "submit":
+            job_id = str(uuid.uuid4())[:8]
+
+            job_queue.put({
+                "job_id": job_id,
+                "task": data.get("task", data.get("payload", ""))
+            })
+
+            print(f"[SERVER] Job queued: {job_id}")
+
+            send_message(conn, {
+                "status": "queued",
+                "job_id": job_id
+            })
+
+    except Exception as e:
+        print("[SERVER ERROR]", e)
+
+    finally:
+        if worker_id:
+            with lock:
+                workers.pop(worker_id, None)
+                busy_workers.discard(worker_id)
+
+            print(f"[SERVER] Worker disconnected: {worker_id}")
+
+        conn.close()
 
 
-class ThreadedTCPServer(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+def start_server():
+    threading.Thread(
+        target=scheduler_loop,
+        args=(job_queue, workers, busy_workers, lock),
+        daemon=True
+    ).start()
 
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="0.0.0.0", help="interface to listen on")
-    parser.add_argument("--port", type=int, default=5000)
-    args = parser.parse_args()
-    with ThreadedTCPServer((args.host, args.port), JobRequestHandler) as server:
-        print(f"Job server listening on {args.host}:{args.port}", flush=True)
-        print("Jobs are acknowledged when added to the in-memory FIFO queue.", flush=True)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nStopping job server.", flush=True)
+    server.bind((HOST, PORT))
+    server.listen()
+
+    print(f"[SERVER] Listening on port {PORT}")
+
+    while True:
+        conn, address = server.accept()
+
+        threading.Thread(
+            target=handle_connection,
+            args=(conn, address),
+            daemon=True
+        ).start()
 
 
 if __name__ == "__main__":
-    main()
+    start_server()
