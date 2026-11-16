@@ -1,0 +1,94 @@
+DISTRIBUTED JOB QUEUE
+WITH SDN FAILOVER
+Computer Networks Project Report
+Team 3  •  Bennett Tony Kunnapilly(SRN:PES1UG25AM072), Debayan Nandi(SRN:PES1UG25AM106), Deekshith G(SRN:PES1UG25AM107)
+This report describes the TCP job-submission service, worker execution flow, Mininet network, OS-Ken controller, and recorded normal and link-failure measurements.
+Stage	Implemented outcome
+D1	TCP submission, IDs and acknowledgements, FIFO queue, worker execution, Mininet and OS-Ken integration
+D2	Adaptive SDN routing over redundant paths, static comparison, status measurement and CSV benchmarks
+ 
+1. Executive Summary
+Team 3 built a distributed job-processing system and placed its client, server, and worker on a software-defined network. Clients submit jobs to a TCP server. The server assigns a unique ID, acknowledges the accepted job, stores it in a FIFO queue, and dispatches work to registered workers. Workers execute tasks and report completion. An OS-Ken controller programs OpenFlow switches in Mininet. D2 adds a primary and alternate network path and tests the system after a link failure.
+In the submitted single-run benchmarks, adaptive routing completed 10/10 jobs after the primary link was disabled. Static primary-path routing completed 0/10 within its 15-second wait. These VM results demonstrate availability behavior; they are not a statistically controlled performance study.
+2. Problem, objectives, and scope
+The problem is to accept client work reliably, identify each submission, queue it while workers are busy, and report completion. The network should provide connectivity and, in D2, continue carrying traffic after a path failure.
+•	Implement TCP client/server messaging with job IDs, acknowledgements, status, and results.
+•	Queue jobs FIFO and assign them to available registered workers.
+•	Connect Mininet hosts through Open vSwitch switches controlled by OS-Ken.
+•	Add redundant network paths and compare adaptive failover with a static baseline.
+•	Measure completion count, latency, and throughput.
+Deliverable	Evidence
+D1	Acknowledged client jobs, unique IDs, FIFO worker execution/completion, basic Mininet connectivity and controller forwarding.
+D2	Four-switch redundant topology, adaptive link-event response, static comparison, benchmark output and CSV data.
+ 
+3. Architecture
+The system has three layers. The application layer contains the TCP client, job server, scheduler, and worker. The data plane is Mininet with Open vSwitch. The control plane is OS-Ken, which communicates with switches using OpenFlow 1.3 and installs forwarding rules.
+Node	Role	Address
+h1	Job server	10.0.0.1, TCP port 5000
+h2	Client / benchmark	10.0.0.2
+h3	Worker	10.0.0.3
+h4	Additional host	10.0.0.4
+s1–s4	Open vSwitch	OpenFlow 1.3 controlled
+OS-Ken	SDN controller	Learns locations and selects active paths
+D2 uses a diamond network. h1 and h2 attach to s1; h3 and h4 attach to s4. The primary inter-switch path is s1–s2–s4; the alternate is s1–s3–s4. Adaptive mode tracks link state, clears stale route flows after a link event, and selects a path across active links. Static mode restricts routing to the primary path.
+3.1 Job lifecycle and protocol
+Step	Operation
+1	Client sends a JSON job request over TCP.
+2	Server assigns a sequential job ID, enqueues the job, and acknowledges receipt.
+3	Scheduler selects an idle registered worker and dispatches the oldest job.
+4	Worker simulates execution and reports its result to the server.
+5	Server records status; benchmark client polls until completion or timeout.
+Messages are newline-delimited JSON. TCP is a byte stream, so the newline marks the end of each application message. The shared protocol helper reads complete lines and applies a 1 MB message-size limit.
+ 
+4. Implementation and team responsibilities
+Files	Purpose
+server.py, client.py, common.py	TCP listener/client, JSON framing, submission, acknowledgement and status handling.
+scheduler.py	FIFO queue and round-robin selection among idle workers.
+worker.py	Worker registration, job receipt, simulated task execution and completion report.
+sdn/topology.py	Mininet hosts, four OpenFlow switches and redundant links.
+sdn/team3_controller.py	OS-Ken OpenFlow 1.3 app: host learning, active-path selection and link-event handling.
+sdn/run_controller.py	Starts adaptive routing controller.
+sdn/run_controller_static.py	Starts fixed primary-path comparison mode.
+benchmark.py	Submits jobs, polls status, computes metrics, writes CSV.
+test_clients.py, test_worker_flow.py	Concurrent submissions/unique IDs and FIFO worker-flow checks.
+Member	Responsibility
+Bennett	TCP client/server, job IDs and acknowledgements, FIFO submission queue and integration.
+Debayan	Mininet topology, OS-Ken controller connection and OpenFlow forwarding/failover.
+Deekshith	Worker registration and execution, completion reporting, integration/test evidence.
+This table reflects the team’s agreed task split; confirm individual contributions with teammates before final submission.
+5. Test method
+Application checks run with Python; network checks run in Ubuntu with Mininet, Open vSwitch, and OS-Ken. The D2 comparison uses normal and link-failure scenarios. `pingall` checks host reachability, worker logs verify registration, and the benchmark polls each job’s final status and writes one CSV row per submitted job.
+Test	Expected/recorded evidence
+Worker-flow test	Worker registers, receives three FIFO jobs and reports all results.
+Concurrent clients	Eight clients receive acknowledgements with unique IDs.
+Mininet baseline	nodes lists h1–h4 and s1–s4; pingall reports 0% dropped.
+Worker registration	Server log reports worker1 from 10.0.0.3.
+Normal benchmark	10 jobs complete and summary/CSV are produced.
+Link failure	Disable s1–s2; adaptive completes on alternate path; static does not complete within the timeout.
+ 
+6. Recorded benchmark results
+Values below come from the supplied terminal outputs and CSV files. “Completed” counts jobs whose server status became completed within the benchmark wait window.
+Scenario	Completed	Elapsed	Mean	P95	Rate
+Static, normal	10/10	5.613 s	3.089 s	5.582 s	1.78 jobs/s
+Static, primary link down	0/10	15.118 s	N/A	N/A	0 jobs/s
+Adaptive, normal	10/10	5.818 s	3.184 s	5.778 s	1.72 jobs/s
+Adaptive, after failover	10/10	5.777 s	3.157 s	5.745 s	1.73 jobs/s
+The central D2 finding is that adaptive mode completed all ten jobs after the primary path was taken down, while the static baseline completed none before timeout. Normal-mode timings are close in this single run and do not prove a speed advantage.
+6.1 CSV contents
+Each CSV contains a scenario label, job ID, status, and completion time in seconds. Summary output aggregates completed jobs, elapsed duration, mean and P95 latency, and throughput. A job that remains queued or otherwise incomplete at timeout is not counted as completed.
+7. Limitations and future work
+•	Queue, job records and worker state are in memory, so restarting the server loses them.
+•	Worker execution is simulated with a short delay rather than running arbitrary submitted programs.
+•	Measurements are single VM runs with only ten jobs; repeated larger runs would produce stronger comparisons.
+•	Static mode intentionally uses only the primary path.
+•	Future improvements include durable storage, authentication, idempotent retry, worker health checks and resource-aware scheduling.
+8. Reproduction overview
+Use an Ubuntu VM with Mininet, Open vSwitch and OS-Ken. From a normal shell, start the adaptive controller in its own terminal with `cd sdn` and `python3 run_controller.py`. In another shell, clean and start Mininet using `sudo mn -c` and `sudo python3 sdn/topology.py`. At the `mininet>` prompt, run `nodes` and `pingall`; then start the server on h1 and worker on h3, and submit ten jobs from h2 with benchmark.py. Disable the primary link using `link s1 s2 down`, then repeat the adaptive benchmark. The project README contains exact commands.
+Important: commands prefixed with h1/h2/h3 and `link ...` belong at the `mininet>` prompt. Controller commands run in a separate Ubuntu terminal. Exit Mininet with `exit` and clean stale networks with `sudo mn -c`.
+9. Conclusion
+The project demonstrates a TCP job-submission and worker-completion path integrated with an SDN-controlled Mininet network. D1 covers the queue and end-to-end job flow. D2 adds redundant network paths, adaptive OpenFlow failover, a static comparison, and measured job outcomes. The submitted evidence supports successful job completion after the tested primary-link failure in adaptive mode.
+References and project evidence
+•	Mininet overview: https://mininet.org/overview/
+•	OS-Ken components: https://docs.openstack.org/os-ken/latest/components.html
+•	OS-Ken application API: https://docs.openstack.org/os-ken/latest/os_ken_app_api.html
+•	Team 3 source code, README, architecture description, benchmark CSV files and submitted Ubuntu screenshots.
